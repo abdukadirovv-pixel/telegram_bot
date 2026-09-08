@@ -37,8 +37,8 @@ SECRET_CODES = {
     "FIZIKA-KEY": "documents/fizika_formulas.pdf",
     "vocab": "documents/nnt.pdf",
     "rasp": "documents/rasp.jpg",
-    "myielts": "documents/myielts.jpg",
-    "mycefr": "documents/mycefr.jpg",
+    "myielts": "documents/myielts.pdf",
+    "mycefr": "documents/mycefr.pdf",
 }
 
 # ---------------------------------------------------------------------------
