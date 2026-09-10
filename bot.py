@@ -2,13 +2,31 @@
 10-B Aniq Lesson Reminder and Document Vault — Telegram bot.
 
 Run with:  python bot.py
-Requires:  BOT_TOKEN set as an environment variable.
+Requires:  BOT_TOKEN set as an environment variable (see config.py / README).
+
+Features
+--------
+1. Secure Document Vault: send a known secret code as a plain text message,
+   get the matching file back.
+2. Automated Mon-Fri 08:45 daily brief with the full lesson list, including
+   an explicit line for lesson 7 even when it's unused, and an explicit
+   "school day ends at ..." line.
+3. /check <day> diagnostic command to preview any day's brief on demand
+   (day codes: du, se, ch, pa, ju).
+4. Real-time per-lesson notifications: a message fires the moment each
+   lesson ends, announcing the next lesson's subject/room/teacher/start
+   time, or "school's out" after the actual last lesson of the day.
+
+Scheduling is done with python-telegram-bot's JobQueue, which is built on
+top of APScheduler (AsyncIOScheduler) internally — this avoids manually
+wiring a second event loop alongside PTB's own, while still using
+APScheduler under the hood as specified.
 """
 
 import json
 import logging
 import os
-from datetime import datetime, time as dtime
+from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -26,14 +44,12 @@ from config import (
     BOT_TOKEN,
     DAY_CODES,
     DAY_NAMES,
-    DEFAULT_SECRET_CODES,
     REMINDER_HOUR,
     REMINDER_MINUTE,
-    STORAGE_CHANNEL,
+    SECRET_CODES,
     SUBSCRIBERS_FILE,
     TIMETABLE,
     TIMEZONE,
-    VAULT_FILE,
 )
 
 logging.basicConfig(
@@ -41,6 +57,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("aniq10b_bot")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _tz_time(hhmm: str) -> dtime:
@@ -50,7 +68,7 @@ def _tz_time(hhmm: str) -> dtime:
 
 
 # ---------------------------------------------------------------------------
-# Persistence helpers (Subscribers & Vault)
+# Subscriber persistence (which chats should get the 08:45 reminder)
 # ---------------------------------------------------------------------------
 
 def load_subscribers() -> set:
@@ -69,22 +87,6 @@ def save_subscribers(subscribers: set) -> None:
         json.dump(sorted(subscribers), f)
 
 
-def load_vault() -> dict:
-    vault = DEFAULT_SECRET_CODES.copy()
-    if os.path.exists(VAULT_FILE):
-        try:
-            with open(VAULT_FILE, "r", encoding="utf-8") as f:
-                vault.update(json.load(f))
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read vault file (%s), using defaults.", exc)
-    return vault
-
-
-def save_vault(vault: dict) -> None:
-    with open(VAULT_FILE, "w", encoding="utf-8") as f:
-        json.dump(vault, f, indent=4)
-
-
 # ---------------------------------------------------------------------------
 # Schedule rendering
 # ---------------------------------------------------------------------------
@@ -100,9 +102,10 @@ def build_daily_brief(day_code: str) -> str:
     day_name = DAY_NAMES[day_code]
 
     lines = [f"📅 <b>{day_name} — 10-B Aniq</b>", ""]
-    last_active_end = None
 
-    for slot in BELL_SCHEDULE:
+    last_active_end = None  # end time of the last real (non-empty) lesson
+
+    for slot in BELL_SCHEDULE:  # always 7 slots, in order
         idx = slot["lesson"] - 1
         entry = lessons[idx] if idx < len(lessons) else None
         time_range = f"{slot['start']}–{slot['end']}"
@@ -129,7 +132,7 @@ def build_daily_brief(day_code: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Command Handlers
+# Command handlers
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -144,10 +147,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d}.\n\n"
         "Commands:\n"
         "  /check <du|se|ch|pa|ju> — preview any day's schedule\n"
-        "  /lesson [date|day] [HH:MM] — check what lesson is currently active\n"
         "  /stop — stop receiving daily reminders\n\n"
         "You can also send a secret code as a plain message to receive a "
-        "stored document from the vault."
+        "stored document."
     )
 
 
@@ -173,180 +175,36 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(brief, parse_mode=ParseMode.HTML)
 
 
-async def lesson_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    now_local = datetime.now(ZoneInfo(TIMEZONE))
-    target_date = now_local.date()
-    target_time = now_local.time()
-    
-    args = context.args
-    day_code = None
-    
-    if args:
-        first_arg = args[0].lower()
-        try:
-            parsed_dt = datetime.strptime(first_arg, "%d.%m.%Y")
-            target_date = parsed_dt.date()
-            weekday = target_date.weekday()
-            if weekday > 4:
-                await update.message.reply_text(f"📅 {target_date.strftime('%d.%m.%Y')} is a weekend! No lessons scheduled.")
-                return
-            day_code = DAY_CODES[weekday]
-        except ValueError:
-            day_map = {
-                "du": "du", "dushanba": "du", "monday": "du", "mon": "du",
-                "se": "se", "seshanba": "se", "tuesday": "se", "tue": "se",
-                "ch": "ch", "chorshanba": "ch", "wednesday": "ch", "wed": "ch",
-                "pa": "pa", "payshanba": "pa", "thursday": "pa", "thu": "pa",
-                "ju": "ju", "juma": "ju", "friday": "ju", "fri": "ju",
-            }
-            if first_arg in day_map:
-                day_code = day_map[first_arg]
-            else:
-                await update.message.reply_text(
-                    "Invalid format! Usage examples:\n"
-                    "  /lesson\n"
-                    "  /lesson 24.09.2026 10:30\n"
-                    "  /lesson friday 11:00"
-                )
-                return
-        
-        if len(args) > 1:
-            try:
-                th, tm = map(int, args[1].split(":"))
-                target_time = dtime(hour=th, minute=tm, tzinfo=ZoneInfo(TIMEZONE))
-            except ValueError:
-                await update.message.reply_text("Invalid time format! Use HH:MM (e.g. 10:30).")
-                return
-    else:
-        weekday = now_local.weekday()
-        if weekday > 4:
-            await update.message.reply_text("📅 Today is a weekend! No lessons scheduled.")
-            return
-        day_code = DAY_CODES[weekday]
-
-    if not day_code or day_code not in TIMETABLE:
-        await update.message.reply_text("No timetable found for this day.")
-        return
-
-    lessons = TIMETABLE[day_code]
-    day_name = DAY_NAMES[day_code]
-    target_mins = target_time.hour * 60 + target_time.minute
-    
-    status_msg = f"🔍 <b>Status for {day_name}</b> (at {target_time.strftime('%H:%M')}):\n\n"
-    active_found = False
-    
-    for slot in BELL_SCHEDULE:
-        idx = slot["lesson"] - 1
-        entry = lessons[idx] if idx < len(lessons) else None
-        
-        sh, sm = map(int, slot["start"].split(":"))
-        eh, em = map(int, slot["end"].split(":"))
-        start_mins = sh * 60 + sm
-        end_mins = eh * 60 + em
-        
-        if start_mins <= target_mins <= end_mins:
-            active_found = True
-            if entry is None:
-                status_msg += f"⏸️ Currently in <b>Lesson {slot['lesson']}</b> ({slot['start']}–{slot['end']}): <i>(bo'sh / unused slot)</i>"
-            else:
-                teachers = ", ".join(entry["teachers"])
-                room = entry["room"] if entry["room"] else "TBD"
-                status_msg += (
-                    f"📚 Currently in <b>Lesson {slot['lesson']}</b> ({slot['start']}–{slot['end']})\n"
-                    f"Subject: <b>{entry['subject']}</b>\n"
-                    f"🏫 Room: {room}   👤 {teachers}"
-                )
-            break
-        elif target_mins < start_mins:
-            active_found = True
-            if slot["lesson"] == 1:
-                status_msg += f"⏳ School hasn't started yet. First lesson starts at {slot['start']}."
-            else:
-                prev_slot = BELL_SCHEDULE[idx - 1]
-                status_msg += f"☕ Currently on a break (between Lesson {prev_slot['lesson']} and Lesson {slot['lesson']}). Next up: <b>{entry['subject'] if entry else 'Unused slot'}</b> at {slot['start']}."
-            break
-    
-    if not active_found:
-        last_slot = BELL_SCHEDULE[-1]
-        last_end_mins = int(last_slot["end"].split(":")[0]) * 60 + int(last_slot["end"].split(":")[1])
-        if target_mins > last_end_mins:
-            status_msg += "🏁 School day has already finished!"
-        else:
-            status_msg += "ℹ️ Outside normal school hours."
-
-    await update.message.reply_text(status_msg, parse_mode=ParseMode.HTML)
-
-
-async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
-    if not message.caption:
-        await message.reply_text("⚠️ Please send the file with the secret code written as its caption!")
-        return
-
-    secret_code = message.caption.strip().upper()
-
-    # Automatically copy the file into your private storage channel
-    try:
-        forwarded = await context.bot.copy_message(
-            chat_id=STORAGE_CHANNEL,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id
-        )
-    except Exception as exc:
-        logger.error("Failed to copy document to storage channel: %s", exc)
-        await message.reply_text("❌ Failed to save document to storage channel. Check bot admin permissions.")
-        return
-    
-    msg_id = forwarded.message_id
-    vault = load_vault()
-    vault[secret_code] = msg_id
-    save_vault(vault)
-
-    await message.reply_text(
-        f"✅ <b>Vault Saved Successfully!</b>\n"
-        f"Code: <code>{secret_code}</code>\n"
-        f"Stored securely in channel with message ID <code>{msg_id}</code>.",
-        parse_mode=ParseMode.HTML
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Checks incoming plain text against the secret-code document vault."""
+    text = (update.message.text or "").strip()
+    match = SECRET_CODES.get(text) or next(
+        (path for code, path in SECRET_CODES.items() if code.lower() == text.lower()),
+        None,
     )
 
+    if not match:
+        return  # not a recognized code — silently ignore
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip()
-    vault = load_vault()
-    
-    msg_id = None
-    for code, m_id in vault.items():
-        if code.lower() == text.lower():
-            msg_id = m_id
-            break
-
-    if not msg_id:
+    full_path = match if os.path.isabs(match) else os.path.join(BASE_DIR, match)
+    if not os.path.exists(full_path):
+        await update.message.reply_text(
+            "That code is valid, but the file isn't on the server yet. "
+            "Please contact the bot admin."
+        )
+        logger.warning("Secret code matched but file missing: %s", full_path)
         return
 
-    try:
-        await context.bot.forward_message(
-            chat_id=update.effective_chat.id,
-            from_chat_id=STORAGE_CHANNEL,
-            message_id=msg_id
-        )
-    except Exception as exc:
-        logger.error("Failed to forward document: %s", exc)
-        await update.message.reply_text(
-            "Could not fetch this document from the storage channel. Contact the admin."
-        )
+    with open(full_path, "rb") as doc:
+        await update.message.reply_document(document=doc)
 
 
 # ---------------------------------------------------------------------------
-# Background Jobs
+# Daily reminder job (runs Mon-Fri at REMINDER_HOUR:REMINDER_MINUTE)
 # ---------------------------------------------------------------------------
 
 async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
-    now_local = datetime.now(ZoneInfo(TIMEZONE))
-    weekday = now_local.weekday()
-    
-    if weekday > 4:
-        return
-
+    weekday = context.job.data["weekday"]  # 0=Mon .. 4=Fri, fixed per job
     day_code = DAY_CODES[weekday]
     brief = build_daily_brief(day_code)
 
@@ -358,19 +216,18 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     for chat_id in subscribers:
         try:
             await context.bot.send_message(chat_id, brief, parse_mode=ParseMode.HTML)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - log and keep going for other users
             logger.error("Failed to send reminder to %s: %s", chat_id, exc)
 
 
-async def announce_next_lesson(context: ContextTypes.DEFAULT_TYPE) -> None:
-    now_local = datetime.now(ZoneInfo(TIMEZONE))
-    weekday = now_local.weekday()
-    
-    if weekday > 4:
-        return
+# ---------------------------------------------------------------------------
+# Per-lesson job: fires at the end of each lesson, announces what's next
+# ---------------------------------------------------------------------------
 
+async def announce_next_lesson(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data
-    lesson_index = data["lesson_index"]
+    weekday = data["weekday"]
+    lesson_index = data["lesson_index"]  # 0-based index of the lesson that just ended
     day_code = DAY_CODES[weekday]
     lessons = TIMETABLE[day_code]
 
@@ -397,12 +254,12 @@ async def announce_next_lesson(context: ContextTypes.DEFAULT_TYPE) -> None:
     for chat_id in subscribers:
         try:
             await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - log and keep going for other users
             logger.error("Failed to send lesson-end announcement to %s: %s", chat_id, exc)
 
 
 # ---------------------------------------------------------------------------
-# Application Setup
+# Application setup
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -417,26 +274,25 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("check", check_command))
-    application.add_handler(CommandHandler("lesson", lesson_status_command))
-    
-    # Handle files sent directly to the bot with captions as secret codes
-    application.add_handler(
-        MessageHandler(filters.Document.ALL | filters.PHOTO, handle_document_upload)
-    )
-    
-    # Handle text messages for fetching vault items or general text
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
 
+    # One job per weekday (Mon-Fri) at 08:45 local (Asia/Tashkent) time.
+    # JobQueue.run_daily is backed by APScheduler's AsyncIOScheduler.
     reminder_time = _tz_time(f"{REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d}")
-    
-    application.job_queue.run_daily(
-        send_daily_reminders,
-        time=reminder_time,
-        name="daily_reminder",
-    )
+    for weekday in range(5):  # 0=Monday .. 4=Friday
+        application.job_queue.run_daily(
+            send_daily_reminders,
+            time=reminder_time,
+            days=(weekday,),
+            data={"weekday": weekday},
+            name=f"daily_reminder_{DAY_CODES[weekday]}",
+        )
 
+    # One job per (weekday, lesson) pair, firing at that lesson's END time,
+    # for every slot that actually has a lesson scheduled that day. Skips
+    # unused slots since no lesson ends there.
     for weekday in range(5):
         day_code = DAY_CODES[weekday]
         lessons = TIMETABLE[day_code]
@@ -448,7 +304,8 @@ def main() -> None:
             application.job_queue.run_daily(
                 announce_next_lesson,
                 time=end_time,
-                data={"lesson_index": lesson_index},
+                days=(weekday,),
+                data={"weekday": weekday, "lesson_index": lesson_index},
                 name=f"lesson_end_{day_code}_{lesson_index + 1}",
             )
 
