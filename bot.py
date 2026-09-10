@@ -2,7 +2,7 @@
 10-B Aniq Lesson Reminder and Document Vault — Telegram bot.
 
 Run with:  python bot.py
-Requires:  BOT_TOKEN set as an environment variable (see config.py / README).
+Requires:  BOT_TOKEN set as an environment variable.
 """
 
 import json
@@ -26,12 +26,14 @@ from config import (
     BOT_TOKEN,
     DAY_CODES,
     DAY_NAMES,
+    DEFAULT_SECRET_CODES,
     REMINDER_HOUR,
     REMINDER_MINUTE,
-    SECRET_CODES,
+    STORAGE_CHANNEL,
     SUBSCRIBERS_FILE,
     TIMETABLE,
     TIMEZONE,
+    VAULT_FILE,
 )
 
 logging.basicConfig(
@@ -40,14 +42,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("aniq10b_bot")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 
 def _tz_time(hhmm: str) -> dtime:
     """Parse an 'HH:MM' string into a tz-aware time in TIMEZONE."""
     hour, minute = map(int, hhmm.split(":"))
     return dtime(hour=hour, minute=minute, tzinfo=ZoneInfo(TIMEZONE))
 
+
+# ---------------------------------------------------------------------------
+# Persistence helpers (Subscribers & Vault)
+# ---------------------------------------------------------------------------
 
 def load_subscribers() -> set:
     if not os.path.exists(SUBSCRIBERS_FILE):
@@ -64,6 +68,26 @@ def save_subscribers(subscribers: set) -> None:
     with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(subscribers), f)
 
+
+def load_vault() -> dict:
+    vault = DEFAULT_SECRET_CODES.copy()
+    if os.path.exists(VAULT_FILE):
+        try:
+            with open(VAULT_FILE, "r", encoding="utf-8") as f:
+                vault.update(json.load(f))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not read vault file (%s), using defaults.", exc)
+    return vault
+
+
+def save_vault(vault: dict) -> None:
+    with open(VAULT_FILE, "w", encoding="utf-8") as f:
+        json.dump(vault, f, indent=4)
+
+
+# ---------------------------------------------------------------------------
+# Schedule rendering
+# ---------------------------------------------------------------------------
 
 def build_daily_brief(day_code: str) -> str:
     """Render the full lesson brief for a given day code (du/se/ch/pa/ju)."""
@@ -104,6 +128,10 @@ def build_daily_brief(day_code: str) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Command Handlers
+# ---------------------------------------------------------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     subscribers = load_subscribers()
@@ -119,7 +147,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  /lesson [date|day] [HH:MM] — check what lesson is currently active\n"
         "  /stop — stop receiving daily reminders\n\n"
         "You can also send a secret code as a plain message to receive a "
-        "stored document."
+        "stored document from the vault."
     )
 
 
@@ -146,10 +174,6 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def lesson_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Checks active lesson status for a specific date (e.g. 24.09.2026) or day name, 
-    and optional hour (e.g. 10:30). Defaults to current date and time.
-    """
     now_local = datetime.now(ZoneInfo(TIMEZONE))
     target_date = now_local.date()
     target_time = now_local.time()
@@ -253,28 +277,59 @@ async def lesson_status_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(status_msg, parse_mode=ParseMode.HTML)
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip()
-    match = SECRET_CODES.get(text) or next(
-        (path for code, path in SECRET_CODES.items() if code.lower() == text.lower()),
-        None,
+async def add_vault_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Optional security: you can lock this down to your Telegram user ID integer if needed
+    if not update.message.reply_to_message or not context.args:
+        await update.message.reply_text(
+            "Usage: Reply to a file in your storage channel with <code>/addvault <SECRET_CODE></code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    secret_code = context.args[0].upper()
+    replied_msg = update.message.reply_to_message
+    msg_id = replied_msg.message_id
+
+    vault = load_vault()
+    vault[secret_code] = msg_id
+    save_vault(vault)
+
+    await update.message.reply_text(
+        f"✅ <b>Vault Updated!</b>\n"
+        f"Code: <code>{secret_code}</code> linked to Message ID <code>{msg_id}</code>.",
+        parse_mode=ParseMode.HTML
     )
 
-    if not match:
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    vault = load_vault()
+    
+    msg_id = None
+    for code, m_id in vault.items():
+        if code.lower() == text.lower():
+            msg_id = m_id
+            break
+
+    if not msg_id:
         return
 
-    full_path = match if os.path.isabs(match) else os.path.join(BASE_DIR, match)
-    if not os.path.exists(full_path):
-        await update.message.reply_text(
-            "That code is valid, but the file isn't on the server yet. "
-            "Please contact the bot admin."
+    try:
+        await context.bot.forward_message(
+            chat_id=update.effective_chat.id,
+            from_chat_id=STORAGE_CHANNEL,
+            message_id=msg_id
         )
-        logger.warning("Secret code matched but file missing: %s", full_path)
-        return
+    except Exception as exc:
+        logger.error("Failed to forward document: %s", exc)
+        await update.message.reply_text(
+            "Could not fetch this document from the storage channel. Contact the admin."
+        )
 
-    with open(full_path, "rb") as doc:
-        await update.message.reply_document(document=doc)
 
+# ---------------------------------------------------------------------------
+# Background Jobs
+# ---------------------------------------------------------------------------
 
 async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     now_local = datetime.now(ZoneInfo(TIMEZONE))
@@ -337,6 +392,10 @@ async def announce_next_lesson(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error("Failed to send lesson-end announcement to %s: %s", chat_id, exc)
 
 
+# ---------------------------------------------------------------------------
+# Application Setup
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
         raise SystemExit(
@@ -350,6 +409,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("lesson", lesson_status_command))
+    application.add_handler(CommandHandler("addvault", add_vault_command))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
