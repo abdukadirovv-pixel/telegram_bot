@@ -277,26 +277,35 @@ async def lesson_status_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(status_msg, parse_mode=ParseMode.HTML)
 
 
-async def add_vault_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Optional security: you can lock this down to your Telegram user ID integer if needed
-    if not update.message.reply_to_message or not context.args:
-        await update.message.reply_text(
-            "Usage: Reply to a file in your storage channel with <code>/addvault <SECRET_CODE></code>",
-            parse_mode=ParseMode.HTML
-        )
+async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message.caption:
+        await message.reply_text("⚠️ Please send the file with the secret code written as its caption!")
         return
 
-    secret_code = context.args[0].upper()
-    replied_msg = update.message.reply_to_message
-    msg_id = replied_msg.message_id
+    secret_code = message.caption.strip().upper()
 
+    # Automatically copy the file into your private storage channel
+    try:
+        forwarded = await context.bot.copy_message(
+            chat_id=STORAGE_CHANNEL,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
+    except Exception as exc:
+        logger.error("Failed to copy document to storage channel: %s", exc)
+        await message.reply_text("❌ Failed to save document to storage channel. Check bot admin permissions.")
+        return
+    
+    msg_id = forwarded.message_id
     vault = load_vault()
     vault[secret_code] = msg_id
     save_vault(vault)
 
-    await update.message.reply_text(
-        f"✅ <b>Vault Updated!</b>\n"
-        f"Code: <code>{secret_code}</code> linked to Message ID <code>{msg_id}</code>.",
+    await message.reply_text(
+        f"✅ <b>Vault Saved Successfully!</b>\n"
+        f"Code: <code>{secret_code}</code>\n"
+        f"Stored securely in channel with message ID <code>{msg_id}</code>.",
         parse_mode=ParseMode.HTML
     )
 
@@ -409,7 +418,13 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("lesson", lesson_status_command))
-    application.add_handler(CommandHandler("addvault", add_vault_command))
+    
+    # Handle files sent directly to the bot with captions as secret codes
+    application.add_handler(
+        MessageHandler(filters.Document.ALL | filters.PHOTO, handle_document_upload)
+    )
+    
+    # Handle text messages for fetching vault items or general text
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
